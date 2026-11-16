@@ -46,9 +46,14 @@ def parse_gpus(tres):
     return int(m.group()) if m else 0
 
 
-def aggregate(text, by="User"):
-    """Parse sacct output into {user-or-account: Usage}."""
+def aggregate(text, by="User", account=None):
+    """Parse sacct output into ({user-or-account: Usage}, cluster CPU-hours).
+
+    The cluster total covers every job in `text`, even when `account` limits
+    the rows reported, so the %cpu column is always a share of the cluster.
+    """
     out = defaultdict(Usage)
+    cluster_cpu_h = 0.0
     for line in text.splitlines():
         cols = line.split("|")
         if len(cols) != len(FIELDS):
@@ -64,6 +69,9 @@ def aggregate(text, by="User"):
         # ReqMem in TRES is the total for the job (e.g. mem=32G)
         mem_mb = parse_mem_mb(tres.get("mem")) or 0.0
         h = elapsed / 3600
+        cluster_cpu_h += ncpu * h
+        if account and r["Account"] != account:
+            continue
         u = out[r[by]]
         u.jobs += 1
         u.wall_h += h
@@ -76,15 +84,15 @@ def aggregate(text, by="User"):
         u.gpu_h += parse_gpus(tres) * h
         u.mem_gb_h += mem_mb / 1024 * h
         u.accounts.add(r["Account"])
-    return out
+    return out, cluster_cpu_h
 
 
 SORT_KEYS = {"cpu": "cpu_h", "gpu": "gpu_h", "mem": "mem_gb_h",
              "jobs": "jobs", "wall": "wall_h"}
 
 
-def render(usage, key, top, label):
-    total_cpu = sum(u.cpu_h for u in usage.values()) or 1.0
+def render(usage, key, top, label, total_cpu):
+    total_cpu = total_cpu or 1.0
     rows = sorted(usage.items(), key=lambda kv: getattr(kv[1], SORT_KEYS[key]),
                   reverse=True)[:top]
     lines = [f"{label:<16}{'jobs':>8}{'cpu-h':>11}{'%cpu':>6}{'gpu-h':>10}"
@@ -92,7 +100,8 @@ def render(usage, key, top, label):
     for name, u in rows:
         lines.append(f"{name:<16}{u.jobs:>8}{u.cpu_h:>11.0f}"
                      f"{u.cpu_h / total_cpu:>6.0%}{u.gpu_h:>10.0f}"
-                     f"{u.mem_gb_h:>11.0f}{u.eff:>9.0%}  "
+                     f"{u.mem_gb_h:>11.0f}"
+                     f"{(f'{u.eff:.0%}' if u.done_cpu_h else '-'):>9}  "
                      f"{','.join(sorted(u.accounts))}")
     return "\n".join(lines)
 
@@ -101,7 +110,8 @@ def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("-S", "--start", default="now-7days")
     ap.add_argument("-E", "--end")
-    ap.add_argument("-A", "--account", help="restrict to one account")
+    ap.add_argument("-A", "--account", help="only count this account's jobs "
+                    "(%%cpu stays relative to the whole cluster)")
     ap.add_argument("-n", "--top", type=int, default=10)
     ap.add_argument("--sort", choices=SORT_KEYS, default="cpu",
                     help="ranking metric (default cpu = requested CPU-hours)")
@@ -113,17 +123,15 @@ def main(argv=None):
            "-o", ",".join(FIELDS)]
     if args.end:
         cmd += ["-E", args.end]
-    if args.account:
-        cmd += ["-A", args.account]
     p = subprocess.run(cmd, capture_output=True, text=True)
     if p.returncode:
         sys.exit(f"sacct failed: {p.stderr.strip()}")
 
     by = "Account" if args.by_account else "User"
-    usage = aggregate(p.stdout, by)
+    usage, cluster_cpu_h = aggregate(p.stdout, by, args.account)
     if not usage:
         sys.exit("no jobs found")
-    print(render(usage, args.sort, args.top, by.lower()))
+    print(render(usage, args.sort, args.top, by.lower(), cluster_cpu_h))
     print(f"\n{sum(u.jobs for u in usage.values())} jobs, "
           f"{len(usage)} {by.lower()}s since {args.start}", file=sys.stderr)
 
