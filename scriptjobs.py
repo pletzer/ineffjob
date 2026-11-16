@@ -30,7 +30,8 @@ from dataclasses import dataclass, field
 
 from ineffjob import parse_batch_scripts, parse_duration, parse_reqtres
 
-FIELDS = ["JobID", "User", "Account", "JobName", "State", "Elapsed", "ReqTRES"]
+FIELDS = ["JobID", "User", "Account", "JobName", "State", "Elapsed", "ReqTRES",
+          "WorkDir"]
 
 # Patterns are applied to command lines (a command position or any word).
 LANG_PATTERNS = {
@@ -54,6 +55,7 @@ class Hit:
     core_hours: float
     langs: dict = field(default_factory=dict)  # lang -> [matching lines]
     other: list = field(default_factory=list)  # non-interpreter commands
+    workdir: str = ""
 
 
 HOUSEKEEPING = set("""
@@ -253,7 +255,8 @@ def parse_jobs(text, min_core_hours):
         ch = ncpu * (parse_duration(r["Elapsed"]) or 0.0) / 3600
         if ch >= min_core_hours:
             jobs[r["JobID"]] = Hit(r["JobID"], r["User"], r["Account"],
-                                   r["JobName"], r["State"].split()[0], ch)
+                                   r["JobName"], r["State"].split()[0], ch,
+                                   workdir=r["WorkDir"])
     return jobs
 
 
@@ -288,6 +291,38 @@ def date_chunks(start, end, days):
     return out or [(start, end)]
 
 
+def fetch_jobs(start, end, min_core_hours, user=None, account=None,
+               chunk_days=3):
+    """Jobs in [start, end] with >= min_core_hours, keyed by JobID.
+
+    Queried in small windows: one huge cluster-wide sacct can overload
+    slurmdbd. Jobs spanning windows repeat but are identical (Elapsed is not
+    clipped to the window), so merging by JobID is safe.
+    """
+    jobs = {}
+    chunks = date_chunks(start, end, chunk_days)
+    for n, (cs, ce) in enumerate(chunks, 1):
+        cmd = ["sacct", "-X", "-n", "-P", "-S", cs, "-E", ce,
+               "-o", ",".join(FIELDS)]
+        cmd += ["-u", user] if user else ["-a"]
+        if account:
+            cmd += ["-A", account]
+        if len(chunks) > 1:
+            print(f"querying {cs[:10]} .. {ce[:10]} ({n}/{len(chunks)})",
+                  file=sys.stderr)
+        jobs.update(parse_jobs(run(cmd), min_core_hours))
+    return jobs
+
+
+def fetch_scripts(ids):
+    """{jobid: batch script} via sacct -B (needs explicit -j, so chunked)."""
+    scripts = {}
+    for i in range(0, len(ids), 200):
+        scripts.update(parse_batch_scripts(
+            run(["sacct", "-B", "-X", "-j", ",".join(ids[i:i + 200])])))
+    return scripts
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("-S", "--start", required=True, help="start date")
@@ -308,29 +343,12 @@ def main(argv=None):
     args = ap.parse_args(argv)
     langs = args.lang or list(LANG_PATTERNS)
 
-    # Query in small windows: one huge cluster-wide sacct can overload
-    # slurmdbd. Jobs spanning windows repeat but are identical (Elapsed is not
-    # clipped to the window), so merging by JobID is safe.
-    jobs = {}
-    chunks = date_chunks(args.start, args.end, args.chunk_days)
-    for n, (cs, ce) in enumerate(chunks, 1):
-        cmd = ["sacct", "-X", "-n", "-P", "-S", cs, "-E", ce,
-               "-o", ",".join(FIELDS)]
-        cmd += ["-u", args.user] if args.user else ["-a"]
-        if args.account:
-            cmd += ["-A", args.account]
-        if len(chunks) > 1:
-            print(f"querying {cs[:10]} .. {ce[:10]} ({n}/{len(chunks)})",
-                  file=sys.stderr)
-        jobs.update(parse_jobs(run(cmd), args.min_core_hours))
+    jobs = fetch_jobs(args.start, args.end, args.min_core_hours, args.user,
+                      args.account, args.chunk_days)
     print(f"{len(jobs)} job(s) over {args.min_core_hours:g} core-hours; "
           f"inspecting scripts...", file=sys.stderr)
-
     ids = sorted(jobs)
-    scripts = {}
-    for i in range(0, len(ids), 200):  # -B requires explicit -j
-        scripts.update(parse_batch_scripts(
-            run(["sacct", "-B", "-X", "-j", ",".join(ids[i:i + 200])])))
+    scripts = fetch_scripts(ids)
 
     hits, noscript, mixed = [], 0, 0
     for jid in ids:
