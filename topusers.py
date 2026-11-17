@@ -9,22 +9,23 @@ TotalCPU as 0, so the steps must be queried and then skipped.
 """
 import argparse
 import re
-import subprocess
 import sys
 from collections import defaultdict
 from dataclasses import dataclass
 
-from ineffjob import parse_duration, parse_mem_mb, parse_reqtres
+from slurmq import contained, job_rows, windows
+from ineffjob import parse_duration, parse_mem_mb, parse_reqtres, physical_cores, add_threads_arg, set_threads_per_core
 
 IN_PROGRESS = {"RUNNING", "PENDING", "SUSPENDED", "REQUEUED", "RESIZING",
                "COMPLETING", "CONFIGURING", "SIGNALING", "STAGE_OUT"}
-FIELDS = ["JobID", "User", "Account", "Elapsed", "ReqTRES", "TotalCPU", "State", "NNodes"]
+FIELDS = ["JobID", "User", "Account", "Elapsed", "ReqTRES", "TotalCPU", "State", "NNodes", "Start", "End",
+          "AllocCPUS"]
 
 
 @dataclass
 class Usage:
     jobs: int = 0
-    cpu_h: float = 0.0      # requested CPUs x elapsed
+    cpu_h: float = 0.0      # physical cores (AllocCPUS/2) x elapsed
     done_cpu_h: float = 0.0  # same, finished jobs only (TotalCPU is final)
     used_cpu_h: float = 0.0  # TotalCPU of finished jobs
     gpu_h: float = 0.0
@@ -46,14 +47,22 @@ def parse_gpus(tres):
     return int(m.group()) if m else 0
 
 
-def aggregate(text, by="User", account=None):
+def aggregate(text, by="User", account=None, out=None, seen=None, cluster=0.0,
+              window=None, pending=None):
     """Parse sacct output into ({user-or-account: Usage}, cluster CPU-hours).
 
     The cluster total covers every job in `text`, even when `account` limits
     the rows reported, so the %cpu column is always a share of the cluster.
     """
-    out = defaultdict(Usage)
-    cluster_cpu_h = 0.0
+    # `out`, `seen` (dict) and `cluster` let callers feed several windows in
+    # turn. A job is counted once (first copy); its CPU time is taken from the
+    # first copy that lies fully inside a window (not clipped). Jobs for which
+    # no such copy was seen are left in `pending` {jobid: usage-key} so the
+    # caller can fetch exact values with job_rows().
+    out = defaultdict(Usage) if out is None else out
+    seen = {} if seen is None else seen
+    pending = {} if pending is None else pending
+    cluster_cpu_h = cluster
     for line in text.splitlines():
         cols = line.split("|")
         if len(cols) != len(FIELDS):
@@ -61,11 +70,21 @@ def aggregate(text, by="User", account=None):
         r = dict(zip(FIELDS, cols))
         if "." in r["JobID"]:  # job step; the job row has the totals
             continue
+        # A requeued job (NODE_FAIL, preemption, ...) keeps its JobID but has one
+        # record per attempt, so JobID alone is not unique: add Start.
+        jid = f'{r["JobID"]}|{r["Start"]}'
+        inside = window is None or contained(r["Start"], r["End"], *window)
+        if jid in seen:
+            if jid in pending and inside:  # a clean copy: use it
+                out[pending.pop(jid)].used_cpu_h += \
+                    (parse_duration(r["TotalCPU"]) or 0.0) / 3600
+            continue
+        seen[jid] = True
         elapsed = parse_duration(r["Elapsed"]) or 0.0
         if not r[by] or elapsed <= 0:  # never started
             continue
         tres = parse_reqtres(r["ReqTRES"])
-        ncpu = int(tres["cpu"]) if tres.get("cpu", "").isdigit() else 0
+        ncpu = physical_cores(r["AllocCPUS"], tres.get("cpu"))  # physical cores
         # ReqMem in TRES is the total for the job (e.g. mem=32G)
         mem_mb = parse_mem_mb(tres.get("mem")) or 0.0
         h = elapsed / 3600
@@ -80,7 +99,10 @@ def aggregate(text, by="User", account=None):
         # would make efficiency look far worse than it is.
         if r["State"].split()[0] not in IN_PROGRESS:
             u.done_cpu_h += ncpu * h
-            u.used_cpu_h += (parse_duration(r["TotalCPU"]) or 0.0) / 3600
+            if inside:
+                u.used_cpu_h += (parse_duration(r["TotalCPU"]) or 0.0) / 3600
+            else:
+                pending[jid] = r[by]
         u.gpu_h += parse_gpus(tres) * h
         u.mem_gb_h += mem_mb / 1024 * h
         u.accounts.add(r["Account"])
@@ -115,20 +137,30 @@ def main(argv=None):
     ap.add_argument("-n", "--top", type=int, default=10)
     ap.add_argument("--sort", choices=SORT_KEYS, default="cpu",
                     help="ranking metric (default cpu = requested CPU-hours)")
+    ap.add_argument("--chunk-days", type=int, default=2,
+                    help="query sacct in windows of this many days (default 2)")
     ap.add_argument("--by-account", action="store_true",
                     help="group by account instead of user")
+    add_threads_arg(ap)
     args = ap.parse_args(argv)
-
-    cmd = ["sacct", "-a", "-n", "-P", "-S", args.start,
-           "-o", ",".join(FIELDS)]
-    if args.end:
-        cmd += ["-E", args.end]
-    p = subprocess.run(cmd, capture_output=True, text=True)
-    if p.returncode:
-        sys.exit(f"sacct failed: {p.stderr.strip()}")
+    set_threads_per_core(args.threads_per_core)
 
     by = "Account" if args.by_account else "User"
-    usage, cluster_cpu_h = aggregate(p.stdout, by, args.account)
+    base = ["sacct", "-a", "-D", "-n", "-P", "-o", ",".join(FIELDS)]
+    usage, seen, pending, cluster_cpu_h = defaultdict(Usage), {}, {}, 0.0
+    for text, lo, hi in windows(base, args.start, args.end, args.chunk_days):
+        window = None if lo is None else (lo, hi)
+        _, cluster_cpu_h = aggregate(text, by, args.account, usage, seen,
+                                     cluster_cpu_h, window, pending)
+    if pending:  # jobs crossing window boundaries: exact CPU time by job ID
+        print(f"fetching exact CPU time for {len(pending)} job(s) that cross "
+              f"window boundaries...", file=sys.stderr)
+        ids = sorted({k.split("|")[0] for k in pending})
+        for line in job_rows(ids, ["JobID", "Start", "TotalCPU"]):
+            jid, start, tc = line.split("|")[:3]
+            key = f"{jid}|{start}"
+            if key in pending:  # job rows only (step rows have '.' ids)
+                usage[pending[key]].used_cpu_h += (parse_duration(tc) or 0.0) / 3600
     if not usage:
         sys.exit("no jobs found")
     print(render(usage, args.sort, args.top, by.lower(), cluster_cpu_h))

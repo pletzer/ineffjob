@@ -40,6 +40,7 @@ from dataclasses import dataclass, field
 
 import scriptjobs
 from scriptjobs import classify_script, command_word, fetch_jobs, fetch_scripts
+from ineffjob import add_threads_arg, set_threads_per_core
 
 # fraction of instructions addressing memory via %rbp above which code looks -O0
 O0_RBP_FRACTION = 0.12
@@ -509,7 +510,9 @@ def main(argv=None):
     ap.add_argument("-n", "--top", type=int, default=25)
     ap.add_argument("--only-suspect", action="store_true",
                     help="job mode: list only -O0 / suspect builds")
+    add_threads_arg(ap)
     args = ap.parse_args(argv)
+    set_threads_per_core(args.threads_per_core)
 
     disasm = not args.no_disasm
     if args.exes:

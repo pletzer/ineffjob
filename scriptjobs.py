@@ -2,7 +2,7 @@
 """scriptjobs: find big jobs that run Python, R or Julia scripts.
 
 1. `sacct -a -X` lists jobs between two dates and keeps those that used at
-   least -C core-hours (requested CPUs x elapsed, same convention as the
+   least -C core-hours (physical cores = AllocCPUS/2, x elapsed, same convention as the
    other ineffjob tools).
 2. `sacct -B` fetches the batch script of each of those jobs only.
 3. The script body (comments, #SBATCH lines and `module ...` lines ignored)
@@ -22,16 +22,14 @@ Run from the repo directory (it imports helpers from ineffjob.py).
 import argparse
 import re
 import shlex
-import subprocess
 import sys
-import time
-from datetime import datetime, timedelta
 from dataclasses import dataclass, field
 
-from ineffjob import parse_batch_scripts, parse_duration, parse_reqtres
+from ineffjob import parse_batch_scripts, parse_duration, parse_reqtres, physical_cores, add_threads_arg, set_threads_per_core
+from slurmq import date_chunks, run
 
 FIELDS = ["JobID", "User", "Account", "JobName", "State", "Elapsed", "ReqTRES",
-          "WorkDir"]
+          "WorkDir", "AllocCPUS"]
 
 # Patterns are applied to command lines (a command position or any word).
 LANG_PATTERNS = {
@@ -251,7 +249,7 @@ def parse_jobs(text, min_core_hours):
             continue
         r = dict(zip(FIELDS, cols))
         tres = parse_reqtres(r["ReqTRES"])
-        ncpu = int(tres["cpu"]) if tres.get("cpu", "").isdigit() else 0
+        ncpu = physical_cores(r["AllocCPUS"], tres.get("cpu"))
         ch = ncpu * (parse_duration(r["Elapsed"]) or 0.0) / 3600
         if ch >= min_core_hours:
             jobs[r["JobID"]] = Hit(r["JobID"], r["User"], r["Account"],
@@ -260,44 +258,14 @@ def parse_jobs(text, min_core_hours):
     return jobs
 
 
-def run(cmd, retries=3):
-    """Run sacct; retry with backoff if slurmdbd refuses the connection."""
-    for attempt in range(retries + 1):
-        p = subprocess.run(cmd, capture_output=True, text=True)
-        if not p.returncode:
-            return p.stdout
-        if "onnection" in p.stderr and attempt < retries:
-            wait = 10 * 3 ** attempt  # 10s, 30s, 90s
-            print(f"slurmdbd unavailable; retrying in {wait}s "
-                  f"({attempt + 1}/{retries})...", file=sys.stderr)
-            time.sleep(wait)
-            continue
-        sys.exit(f"{' '.join(cmd[:3])} ... failed: {p.stderr.strip()}")
-
-
-def date_chunks(start, end, days):
-    """Split [start, end] into windows of `days` days. Falls back to a single
-    window when the dates are not ISO (e.g. 'now-7days')."""
-    try:
-        s, e = datetime.fromisoformat(start), datetime.fromisoformat(end)
-    except ValueError:
-        return [(start, end)]
-    fmt = "%Y-%m-%dT%H:%M:%S"
-    out = []
-    while s < e:
-        nxt = min(s + timedelta(days=days), e)
-        out.append((s.strftime(fmt), nxt.strftime(fmt)))
-        s = nxt
-    return out or [(start, end)]
-
-
 def fetch_jobs(start, end, min_core_hours, user=None, account=None,
                chunk_days=3):
     """Jobs in [start, end] with >= min_core_hours, keyed by JobID.
 
     Queried in small windows: one huge cluster-wide sacct can overload
-    slurmdbd. Jobs spanning windows repeat but are identical (Elapsed is not
-    clipped to the window), so merging by JobID is safe.
+    slurmdbd. Jobs spanning windows repeat; the fields used here (Elapsed,
+    ReqTRES, State, ...) are the same in every copy (unlike TotalCPU), so
+    merging by JobID is safe.
     """
     jobs = {}
     chunks = date_chunks(start, end, chunk_days)
@@ -340,7 +308,9 @@ def main(argv=None):
                     help="query sacct in windows of this many days (default 3)")
     ap.add_argument("-v", "--verbose", action="store_true",
                     help="print the matching script lines")
+    add_threads_arg(ap)
     args = ap.parse_args(argv)
+    set_threads_per_core(args.threads_per_core)
     langs = args.lang or list(LANG_PATTERNS)
 
     jobs = fetch_jobs(args.start, args.end, args.min_core_hours, args.user,

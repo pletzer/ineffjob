@@ -17,7 +17,34 @@ import sys
 from dataclasses import dataclass, field
 
 FIELDS = ["JobID", "State", "Elapsed", "Timelimit", "ReqMem", "TotalCPU",
-          "MaxRSS", "NNodes", "NTasks", "ReqTRES", "User", "Account", "JobName"]
+          "MaxRSS", "NNodes", "NTasks", "ReqTRES", "User", "Account", "JobName",
+          "AllocCPUS"]
+
+# Nodes run several hardware threads per core and Slurm allocates whole cores,
+# so AllocCPUS counts threads. Efficiency is measured against physical cores
+# (AllocCPUS / threads per core); using every hyperthread can exceed 100%
+# (up to 100% x threads per core). Set with --threads-per-core.
+THREADS_PER_CORE = 2
+
+
+def set_threads_per_core(n):
+    global THREADS_PER_CORE
+    if n < 1:
+        raise ValueError("threads per core must be >= 1")
+    THREADS_PER_CORE = n
+
+
+def add_threads_arg(ap):
+    ap.add_argument("--threads-per-core", type=int, default=THREADS_PER_CORE,
+                    help="hardware threads per core: AllocCPUS is divided by "
+                    "this to get physical cores (default %(default)s)")
+
+
+def physical_cores(alloc_cpus, reqtres_cpu=None):
+    """Physical cores of an allocation (falls back to ReqTRES cpu)."""
+    if str(alloc_cpus or "").isdigit() and int(alloc_cpus) > 0:
+        return int(alloc_cpus) / THREADS_PER_CORE
+    return float(reqtres_cpu) if str(reqtres_cpu or "").isdigit() else 0.0
 
 
 # --------------------------------------------------------------------------
@@ -114,7 +141,7 @@ class Job:
     elapsed: float = 0.0
     timelimit: float = None
     req_mem_mb: float = None
-    req_cpus: int = None
+    req_cpus: float = None   # physical cores (AllocCPUS / 2)
     total_cpu: float = 0.0
     max_rss_mb: float = 0.0
     nnodes: int = 1
@@ -142,7 +169,7 @@ def parse_accounting(text):
             j.elapsed = parse_duration(r["Elapsed"]) or 0.0
             j.timelimit = parse_duration(r["Timelimit"])
             j.req_mem_mb = parse_mem_mb(r["ReqMem"])
-            j.req_cpus = int(ncpu) if ncpu and ncpu.isdigit() else None
+            j.req_cpus = physical_cores(r["AllocCPUS"], ncpu) or None
             j.total_cpu = parse_duration(r["TotalCPU"]) or 0.0
             j.nnodes = int(r["NNodes"] or 1)
         else:
@@ -162,9 +189,12 @@ def parse_accounting(text):
 @dataclass
 class Finding:
     jobid: str
-    kind: str
-    message: str
-    suggestion: str
+    kind: str       # cpu | memory | time
+    name: str
+    where: str      # the #SBATCH directive responsible
+    req: float      # requested: CPUs / MB / seconds
+    used: float     # used: avg busy CPUs / peak MB / elapsed seconds
+    waste: float    # CPU-h idle / GB-h reserved but unused / hours of excess limit
 
 
 def _fmt_dur(sec):
@@ -187,47 +217,36 @@ def _directive(job, *keys):
 def check_memory(job, thr):
     if job.state != "COMPLETED" or not job.req_mem_mb or job.max_rss_mb <= 0:
         return None
-    frac = job.max_rss_mb / (job.req_mem_mb * 1.0)
-    if frac >= thr:
+    if job.max_rss_mb / job.req_mem_mb >= thr:
         return None
-    sugg = _fmt_mem(max(job.max_rss_mb * 1.5, 256))
-    where = _directive(job, "mem", "mem-per-cpu") or "memory request"
-    return Finding(job.jobid, "memory",
-                   f"peak RSS {_fmt_mem(job.max_rss_mb)} of "
-                   f"{_fmt_mem(job.req_mem_mb)} requested ({frac:.0%}) [{where}]",
-                   f"--mem={sugg} (peak + 50%)")
+    waste = (job.req_mem_mb - job.max_rss_mb) / 1024 * job.elapsed / 3600
+    return Finding(job.jobid, "memory", job.name,
+                   _directive(job, "mem", "mem-per-cpu") or "memory request",
+                   job.req_mem_mb, job.max_rss_mb, waste)
 
 
 def check_time(job, thr, min_limit):
     if job.state != "COMPLETED" or not job.timelimit:
         return None
-    if job.timelimit < min_limit:
+    if job.timelimit < min_limit or job.elapsed / job.timelimit >= thr:
         return None
-    frac = job.elapsed / job.timelimit
-    if frac >= thr:
-        return None
-    sugg = _fmt_dur(max(job.elapsed * 1.5, 60))
-    where = _directive(job, "time") or "time limit"
-    return Finding(job.jobid, "time",
-                   f"ran {_fmt_dur(job.elapsed)} of {_fmt_dur(job.timelimit)} "
-                   f"requested ({frac:.0%}) [{where}]",
-                   f"--time={sugg} (elapsed + 50%)")
+    return Finding(job.jobid, "time", job.name,
+                   _directive(job, "time") or "time limit",
+                   job.timelimit, job.elapsed,
+                   (job.timelimit - job.elapsed) / 3600)
 
 
 def check_cpu(job, thr, min_elapsed):
     if (job.state != "COMPLETED" or not job.req_cpus or job.req_cpus < 2
             or job.elapsed < min_elapsed):
         return None
-    eff = job.total_cpu / (job.elapsed * job.req_cpus)
-    if eff >= thr:
+    if job.total_cpu / (job.elapsed * job.req_cpus) >= thr:
         return None
     used = job.total_cpu / job.elapsed
-    where = _directive(job, "cpus-per-task", "ntasks") or "CPU request"
-    sugg = max(1, round(used + 0.5))
-    return Finding(job.jobid, "cpu",
-                   f"avg {used:.1f} CPUs busy of {job.req_cpus} requested "
-                   f"({eff:.0%}) [{where}]",
-                   f"request ~{sugg} CPU(s), or check the code is parallel")
+    return Finding(job.jobid, "cpu", job.name,
+                   _directive(job, "cpus-per-task", "ntasks") or "CPU request",
+                   job.req_cpus, used,
+                   (job.req_cpus - used) * job.elapsed / 3600)
 
 
 def analyse(jobs, args):
@@ -239,6 +258,89 @@ def analyse(jobs, args):
             if f:
                 out.append(f)
     return out
+
+
+# --------------------------------------------------------------------------
+# report
+# --------------------------------------------------------------------------
+KIND_ORDER = {"cpu": 0, "memory": 1, "time": 2}
+CHECK_LABEL = {"cpu": "CPU", "memory": "MEM", "time": "TIME"}
+
+
+def _id_range(ids):
+    ids = sorted(ids, key=lambda i: [int(p) if p.isdigit() else 0
+                                     for p in re.split(r"[_.]", i)])
+    if len(ids) == 1:
+        return ids[0]
+    bases = {i.split("_")[0] for i in ids}
+    if len(bases) == 1 and all("_" in i for i in ids):  # array tasks
+        return f"{ids[0].split('_')[0]}_[{ids[0].split('_')[1]}-{ids[-1].split('_')[1]}]"
+    return f"{ids[0]}..{ids[-1]}"
+
+
+def summarise(findings):
+    """Group findings of the same check, job name and directive into rows.
+
+    Suggestions are sized for the worst job in the group, so they are safe
+    to apply to all of them.
+    """
+    groups = {}
+    for f in findings:
+        # drop trailing "(params)" so sweeps of one job group together
+        base = re.sub(r"[_\s]*\(.*\)$", "", f.name) or f.name
+        groups.setdefault((f.kind, base, f.where), []).append(f)
+    rows = []
+    for (kind, name, where), fs in groups.items():
+        req = max(f.req for f in fs)
+        used = max(f.used for f in fs)   # worst case across the group
+        typical = sorted(f.used / f.req for f in fs)[len(fs) // 2]
+        if kind == "cpu":
+            r, u = f"{req:g} cores", f"{used:.1f} cores"
+            sugg = f"{max(1, round(used + 0.5))} core(s), or check the code is parallel"
+        elif kind == "memory":
+            r, u = _fmt_mem(req), _fmt_mem(used)
+            sugg = f"--mem={_fmt_mem(max(used * 1.5, 256))}"
+        else:
+            r, u = _fmt_dur(req), _fmt_dur(used)
+            sugg = f"--time={_fmt_dur(max(used * 1.5, 60))}"
+        rows.append(dict(kind=kind, name=name, ids=_id_range([f.jobid for f in fs]),
+                         n=len(fs), req=r, used=u, typ=typical,
+                         waste=sum(f.waste for f in fs), sugg=sugg, where=where))
+    # most costly first: CPU waste, then memory, then time limits
+    rows.sort(key=lambda r: (KIND_ORDER[r["kind"]], -r["waste"]))
+    return rows
+
+
+def render_report(findings, njobs, top=25):
+    if not findings:
+        return f"No inefficiencies found across {njobs} job(s)."
+    rows = summarise(findings)
+    hidden = max(len(rows) - top, 0)
+    rows = rows[:top]
+    tot = {k: sum(f.waste for f in findings if f.kind == k) for k in KIND_ORDER}
+    out = [f"{len(findings)} finding(s) in {len({f.jobid for f in findings})} of "
+           f"{njobs} job(s), {len(rows)} distinct problem(s)",
+           f"  cores idle:        {tot['cpu']:>10,.0f} core-hours",
+           f"  memory unused:     {tot['memory']:>10,.0f} GB-hours reserved",
+           f"  time limit unused: {tot['time']:>10,.0f} hours (hurts backfill, not charged)",
+           ""]
+    unit = {"cpu": "core-h", "memory": "GB-h", "time": "h"}
+    hdr = ["check", "jobs", "name", "job ids", "requested", "used(max)",
+           "typ.eff", "waste", "suggested change"]
+    table = [hdr]
+    for r in rows:
+        table.append([CHECK_LABEL[r["kind"]], str(r["n"]), r["name"][:32], r["ids"],
+                      r["req"], r["used"], f"{r['typ']:.0%}",
+                      f"{r['waste']:,.0f} {unit[r['kind']]}", r["sugg"]])
+    w = [max(len(row[i]) for row in table) for i in range(len(hdr))]
+    for i, row in enumerate(table):
+        out.append("  ".join(c.ljust(w[j]) if j in (0, 2, 3, 8) else c.rjust(w[j])
+                             for j, c in enumerate(row)).rstrip())
+        if i == 0:
+            out.append("  ".join("-" * x for x in w))
+    if hidden:
+        out.append(f"... {hidden} smaller problem(s) not shown (use --top)")
+    return "\n".join(out)
 
 
 # --------------------------------------------------------------------------
@@ -281,7 +383,11 @@ def main(argv=None):
                     help="ignore time check for limits under N minutes")
     ap.add_argument("--min-elapsed", type=float, default=1,
                     help="ignore cpu check for jobs shorter than N minutes")
+    ap.add_argument("--top", type=int, default=25,
+                    help="max rows in the report (default 25)")
+    add_threads_arg(ap)
     args = ap.parse_args(argv)
+    set_threads_per_core(args.threads_per_core)
 
     filt = sacct_filters(args)
     acct = run(["sacct", "-P", "-n", "-o", ",".join(FIELDS)] + filt)
@@ -298,13 +404,7 @@ def main(argv=None):
             jobs[jid].script = script
             jobs[jid].header = parse_header(script)
 
-    findings = analyse(jobs, args)
-    for f in sorted(findings, key=lambda f: (f.jobid, f.kind)):
-        j = jobs[f.jobid]
-        print(f"{f.jobid} ({j.name}) {f.kind.upper()}: {f.message}\n"
-              f"    -> {f.suggestion}")
-    print(f"\n{len(findings)} finding(s) across {len(jobs)} job(s)",
-          file=sys.stderr)
+    print(render_report(analyse(jobs, args), len(jobs), args.top))
 
 
 if __name__ == "__main__":

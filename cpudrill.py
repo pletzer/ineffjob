@@ -16,16 +16,16 @@ Run from the repo directory (it imports helpers from ineffjob.py).
 """
 import argparse
 import os
-import subprocess
 import sys
 from dataclasses import dataclass, field
 from datetime import datetime
 
-from ineffjob import parse_duration, parse_reqtres
+from slurmq import job_rows, windows
+from ineffjob import parse_duration, parse_reqtres, physical_cores, add_threads_arg, set_threads_per_core
 from topusers import IN_PROGRESS
 
 FIELDS = ["JobID", "JobName", "State", "Elapsed", "Start", "End", "ReqTRES",
-          "TotalCPU", "UserCPU", "SystemCPU", "NNodes", "NTasks", "User"]
+          "TotalCPU", "UserCPU", "SystemCPU", "NNodes", "NTasks", "User", "AllocCPUS"]
 
 
 @dataclass
@@ -45,7 +45,7 @@ class Job:
     elapsed: float = 0.0
     start: float = 0.0
     end: float = 0.0
-    req_cpus: int = 0
+    req_cpus: float = 0.0   # physical cores (AllocCPUS / 2)
     nnodes: int = 1
     total_cpu: float = 0.0
     user_cpu: float = 0.0
@@ -83,7 +83,7 @@ def parse(text):
             j.state = r["State"].split()[0]
             j.elapsed = parse_duration(r["Elapsed"]) or 0.0
             j.start, j.end = ts(r["Start"]), ts(r["End"])
-            j.req_cpus = int(tres["cpu"]) if tres.get("cpu", "").isdigit() else 0
+            j.req_cpus = physical_cores(r["AllocCPUS"], tres.get("cpu"))
             j.nnodes = int(r["NNodes"] or 1)
             j.total_cpu = parse_duration(r["TotalCPU"]) or 0.0
             j.user_cpu = parse_duration(r["UserCPU"]) or 0.0
@@ -165,19 +165,19 @@ def render(jobs, top):
                    f"   <- excluded above: TotalCPU is 0 until jobs end")
 
     out.append("")
-    out.append(f"{'job':<10}{'state':<11}{'elapsed':>10}{'cpus':>6}{'req-h':>9}"
+    out.append(f"{'job':<10}{'state':<11}{'elapsed':>10}{'cores':>6}{'req-h':>9}"
                f"{'eff':>6}{'sys%':>6}{'idle-nostep':>12}{'idle-instep':>12}  notes")
     rows.sort(key=lambda jb: jb[1]["no_step"] + jb[1]["in_step"], reverse=True)
     for j, b in rows[:top]:
         eff = (b["usr"] + b["sys"]) / b["req"] if b["req"] else 0
         sysp = b["sys"] / (b["usr"] + b["sys"]) if (b["usr"] + b["sys"]) else 0
         el = f"{int(j.elapsed // 3600)}:{int(j.elapsed % 3600 // 60):02d}"
-        out.append(f"{j.jobid:<10}{j.state:<11}{el:>10}{j.req_cpus:>6}"
+        out.append(f"{j.jobid:<10}{j.state:<11}{el:>10}{j.req_cpus:>6.0f}"
                    f"{b['req']:>9.0f}{eff:>6.0%}{sysp:>6.0%}"
                    f"{b['no_step']:>12.0f}{b['in_step']:>12.0f}  {verdict(j, b)}")
     for j in sorted(live, key=lambda j: -j.req_cpu_s)[:top]:
         el = f"{int(j.elapsed // 3600)}:{int(j.elapsed % 3600 // 60):02d}"
-        out.append(f"{j.jobid:<10}{j.state:<11}{el:>10}{j.req_cpus:>6}"
+        out.append(f"{j.jobid:<10}{j.state:<11}{el:>10}{j.req_cpus:>6.0f}"
                    f"{j.req_cpu_s / HOUR:>9.0f}{'?':>6}{'?':>6}{'?':>12}{'?':>12}"
                    f"  still running: efficiency unknown")
     return "\n".join(out)
@@ -190,26 +190,28 @@ def main(argv=None):
     ap.add_argument("-u", "--user")
     ap.add_argument("-A", "--account")
     ap.add_argument("-j", "--jobs")
+    ap.add_argument("--chunk-days", type=int, default=3,
+                    help="query sacct in windows of this many days (default 3)")
     ap.add_argument("-n", "--top", type=int, default=15,
                     help="jobs to list (default 15)")
+    add_threads_arg(ap)
     args = ap.parse_args(argv)
+    set_threads_per_core(args.threads_per_core)
     if not (args.user or args.account or args.jobs):
         ap.error("give at least one of -u, -A, -j")
 
-    cmd = ["sacct", "-n", "-P", "-S", args.start, "-o", ",".join(FIELDS)]
-    if args.user or args.account or args.jobs:
-        cmd.append("-a" if not args.user else "-u")
-    if args.user:
-        cmd.append(args.user)
-    for flag, val in (("-E", args.end), ("-A", args.account), ("-j", args.jobs)):
+    # Windows only enumerate job IDs (-X: light rows, avoids overloading
+    # slurmdbd); the numbers then come from `sacct -j`, which is not clipped
+    # to a window (see slurmq.py).
+    enum = ["sacct", "-X", "-n", "-P", "-o", "JobID"]
+    enum += ["-u", args.user] if args.user else ["-a"]
+    for flag, val in (("-A", args.account), ("-j", args.jobs)):
         if val:
-            cmd += [flag, val]
-    # ISO timestamps with year and seconds
-    p = subprocess.run(cmd, capture_output=True, text=True,
-                       env={**os.environ, "SLURM_TIME_FORMAT": "standard"})
-    if p.returncode:
-        sys.exit(f"sacct failed: {p.stderr.strip()}")
-    jobs = parse(p.stdout)
+            enum += [flag, val]
+    ids = set()
+    for text, _, _ in windows(enum, args.start, args.end, args.chunk_days):
+        ids.update(l.strip() for l in text.splitlines() if l.strip())
+    jobs = parse("\n".join(job_rows(sorted(ids), FIELDS))) if ids else {}
     if not jobs:
         sys.exit("no jobs found")
     print(render(jobs, args.top))
