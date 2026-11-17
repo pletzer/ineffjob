@@ -165,19 +165,19 @@ def render(jobs, top):
                    f"   <- excluded above: TotalCPU is 0 until jobs end")
 
     out.append("")
-    out.append(f"{'job':<10}{'state':<11}{'elapsed':>10}{'cores':>6}{'req-h':>9}"
+    out.append(f"{'job':<14}{'state':<11}{'elapsed':>10}{'cores':>6}{'req-h':>9}"
                f"{'eff':>6}{'sys%':>6}{'idle-nostep':>12}{'idle-instep':>12}  notes")
     rows.sort(key=lambda jb: jb[1]["no_step"] + jb[1]["in_step"], reverse=True)
     for j, b in rows[:top]:
         eff = (b["usr"] + b["sys"]) / b["req"] if b["req"] else 0
         sysp = b["sys"] / (b["usr"] + b["sys"]) if (b["usr"] + b["sys"]) else 0
         el = f"{int(j.elapsed // 3600)}:{int(j.elapsed % 3600 // 60):02d}"
-        out.append(f"{j.jobid:<10}{j.state:<11}{el:>10}{j.req_cpus:>6.0f}"
+        out.append(f"{j.jobid:<14}{j.state:<11}{el:>10}{j.req_cpus:>6.0f}"
                    f"{b['req']:>9.0f}{eff:>6.0%}{sysp:>6.0%}"
                    f"{b['no_step']:>12.0f}{b['in_step']:>12.0f}  {verdict(j, b)}")
     for j in sorted(live, key=lambda j: -j.req_cpu_s)[:top]:
         el = f"{int(j.elapsed // 3600)}:{int(j.elapsed % 3600 // 60):02d}"
-        out.append(f"{j.jobid:<10}{j.state:<11}{el:>10}{j.req_cpus:>6.0f}"
+        out.append(f"{j.jobid:<14}{j.state:<11}{el:>10}{j.req_cpus:>6.0f}"
                    f"{j.req_cpu_s / HOUR:>9.0f}{'?':>6}{'?':>6}{'?':>12}{'?':>12}"
                    f"  still running: efficiency unknown")
     return "\n".join(out)

@@ -13,6 +13,7 @@ window boundary, ask for them by ID (job_rows(): `sacct -j` has no window and
 returns the exact totals, ~0.4 s per 300 jobs).
 """
 import os
+import re
 import subprocess
 import sys
 import time
@@ -34,13 +35,27 @@ def run(cmd, retries=3, env=None):
         sys.exit(f"{' '.join(cmd[:3])} ... failed: {p.stderr.strip()}")
 
 
+_REL = re.compile(r"now(?:-(\d+)(minute|hour|day|week)s?)?$")
+_UNIT = {"minute": 60, "hour": 3600, "day": 86400, "week": 604800}
+
+
+def parse_when(text, now=None):
+    """ISO date/time or sacct-style 'now[-Ndays|hours|weeks|minutes]' -> datetime.
+    Raises ValueError for anything else."""
+    now = now or datetime.now().replace(microsecond=0)
+    m = _REL.match(text)
+    if m:
+        return now - timedelta(seconds=int(m.group(1) or 0) * _UNIT.get(m.group(2), 0))
+    return datetime.fromisoformat(text)
+
+
 def date_chunks(start, end, days):
     """Split [start, end] into windows of `days` days. Falls back to a single
-    window when the dates are not ISO (e.g. 'now-7days')."""
-    if end is None:
-        end = datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
+    window when a date cannot be parsed."""
     try:
-        s, e = datetime.fromisoformat(start), datetime.fromisoformat(end)
+        now = datetime.now().replace(microsecond=0)
+        s = parse_when(start, now)
+        e = parse_when(end, now) if end else now
     except ValueError:
         return [(start, end)]
     fmt = "%Y-%m-%dT%H:%M:%S"
@@ -52,18 +67,30 @@ def date_chunks(start, end, days):
     return out or [(start, end)]
 
 
+def _hms(sec):
+    sec = int(sec)
+    return f"{sec // 3600}:{sec % 3600 // 60:02d}:{sec % 60:02d}" if sec >= 3600 \
+        else f"{sec // 60}:{sec % 60:02d}"
+
+
 def windows(base_cmd, start, end, days, env=None):
     """Yield (sacct output, lo, hi) for each window. lo/hi are the window
     bounds as datetimes, or None when dates are not ISO (single query, where
     contained() is always True). Runs sacct with SLURM_TIME_FORMAT=standard so
-    Start/End columns parse."""
+    Start/End columns parse. Progress (rows, time, ETA) goes to stderr."""
     env = env or {**os.environ, "SLURM_TIME_FORMAT": "standard"}
     chunks = date_chunks(start, end, days)
+    n_total, t0 = len(chunks), time.time()
     for n, (cs, ce) in enumerate(chunks, 1):
-        if len(chunks) > 1:
-            print(f"querying {cs[:10]} .. {ce[:10]} ({n}/{len(chunks)})",
-                  file=sys.stderr)
+        label = f"{cs[:10]} .. {(ce or 'now')[:10]}"
+        print(f"[{n}/{n_total}] querying {label} ...", end=" ", flush=True,
+              file=sys.stderr)
+        t1 = time.time()
         text = run(base_cmd + ["-S", cs] + (["-E", ce] if ce else []), env=env)
+        done, took = time.time() - t0, time.time() - t1
+        eta = f", ETA {_hms(done / n * (n_total - n))}" if n < n_total else ""
+        print(f"{text.count(chr(10)):,} rows in {_hms(took)} "
+              f"(elapsed {_hms(done)}{eta})", file=sys.stderr)
         try:
             lo, hi = datetime.fromisoformat(cs), datetime.fromisoformat(ce)
         except (ValueError, TypeError):
@@ -87,6 +114,9 @@ def job_rows(ids, fields, batch=300, env=None):
     env = env or {**os.environ, "SLURM_TIME_FORMAT": "standard"}
     ids = list(ids)
     for i in range(0, len(ids), batch):
+        if len(ids) > batch:
+            print(f"  fetching exact data: {min(i + batch, len(ids)):,}/{len(ids):,} jobs",
+                  file=sys.stderr)
         out = run(["sacct", "-n", "-P", "-o", ",".join(fields), "-j",
                    ",".join(ids[i:i + batch])], env=env)
         yield from out.splitlines()
