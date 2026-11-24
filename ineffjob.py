@@ -236,9 +236,8 @@ def check_time(job, thr, min_limit):
                    (job.timelimit - job.elapsed) / 3600)
 
 
-def check_cpu(job, thr, min_elapsed):
-    if (job.state != "COMPLETED" or not job.req_cpus or job.req_cpus < 2
-            or job.elapsed < min_elapsed):
+def check_cpu(job, thr):
+    if job.state != "COMPLETED" or not job.req_cpus or job.req_cpus < 2:
         return None
     if job.total_cpu / (job.elapsed * job.req_cpus) >= thr:
         return None
@@ -251,10 +250,13 @@ def check_cpu(job, thr, min_elapsed):
 
 def analyse(jobs, args):
     out = []
+    min_elapsed = args.min_elapsed * 60
     for j in jobs.values():
+        if j.elapsed <= 0 or j.elapsed < min_elapsed:
+            continue   # too short to judge: likely crashed or a quick test
         for f in (check_memory(j, args.mem_threshold),
                   check_time(j, args.time_threshold, args.min_timelimit * 60),
-                  check_cpu(j, args.cpu_threshold, args.min_elapsed * 60)):
+                  check_cpu(j, args.cpu_threshold)):
             if f:
                 out.append(f)
     return out
@@ -382,7 +384,7 @@ def main(argv=None):
     ap.add_argument("--min-timelimit", type=float, default=10,
                     help="ignore time check for limits under N minutes")
     ap.add_argument("--min-elapsed", type=float, default=1,
-                    help="ignore cpu check for jobs shorter than N minutes")
+                    help="ignore jobs that ran for less than N minutes (default 1)")
     ap.add_argument("--top", type=int, default=25,
                     help="max rows in the report (default 25)")
     add_threads_arg(ap)
